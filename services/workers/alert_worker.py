@@ -2,38 +2,33 @@ import hashlib
 import json
 import os
 import time
-from datetime import datetime
-from typing import Optional
 
 import psycopg2
 from psycopg2.extensions import connection as PGConnection
 from psycopg2.extensions import cursor as PGCursor
 
-PG_HOST = os.getenv("PG_HOST", "postgres")
-PG_PORT = int(os.getenv("PG_PORT", "5432"))
-PG_DB = os.getenv("PG_DB", "sentinel")
-PG_USER = os.getenv("PG_USER", "sentinel")
+PG_HOST     = os.getenv("PG_HOST", "postgres")
+PG_PORT     = int(os.getenv("PG_PORT", "5432"))
+PG_DB       = os.getenv("PG_DB", "sentinel")
+PG_USER     = os.getenv("PG_USER", "sentinel")
 PG_PASSWORD = os.getenv("PG_PASSWORD", "sentinel")
 
-ALERT_POLL_INTERVAL_SECONDS = int(os.getenv("ALERT_POLL_INTERVAL_SECONDS", "15"))
-ALERT_LOOKBACK_MINUTES = int(os.getenv("ALERT_LOOKBACK_MINUTES", "15"))
+ALERT_POLL_INTERVAL_SECONDS  = int(os.getenv("ALERT_POLL_INTERVAL_SECONDS", "15"))
+ALERT_LOOKBACK_MINUTES       = int(os.getenv("ALERT_LOOKBACK_MINUTES", "15"))
 SSH_BRUTEFORCE_WINDOW_MINUTES = int(os.getenv("SSH_BRUTEFORCE_WINDOW_MINUTES", "5"))
-SSH_BRUTEFORCE_THRESHOLD = int(os.getenv("SSH_BRUTEFORCE_THRESHOLD", "5"))
-SURICATA_HIGH_SEVERITY_MIN = int(os.getenv("SURICATA_HIGH_SEVERITY_MIN", "3"))
-
-# Délai avant fermeture automatique d'une alerte inactive (en heures)
-STALE_ALERT_HOURS = int(os.getenv("STALE_ALERT_HOURS", "24"))
+SSH_BRUTEFORCE_THRESHOLD     = int(os.getenv("SSH_BRUTEFORCE_THRESHOLD", "5"))
+SURICATA_HIGH_SEVERITY_MIN   = int(os.getenv("SURICATA_HIGH_SEVERITY_MIN", "3"))
+PORT_SCAN_WINDOW_MINUTES     = int(os.getenv("PORT_SCAN_WINDOW_MINUTES", "2"))
+PORT_SCAN_THRESHOLD          = int(os.getenv("PORT_SCAN_THRESHOLD", "20"))
+STALE_ALERT_HOURS            = int(os.getenv("STALE_ALERT_HOURS", "24"))
 
 
 def connect_pg() -> PGConnection:
     while True:
         try:
             conn = psycopg2.connect(
-                host=PG_HOST,
-                port=PG_PORT,
-                dbname=PG_DB,
-                user=PG_USER,
-                password=PG_PASSWORD,
+                host=PG_HOST, port=PG_PORT,
+                dbname=PG_DB, user=PG_USER, password=PG_PASSWORD,
             )
             conn.autocommit = False
             print("[alert-worker] connected to postgres", flush=True)
@@ -72,22 +67,17 @@ def upsert_alert(
         VALUES (%s, %s, %s, 'open', %s, %s, %s, %s, %s::jsonb)
         ON CONFLICT (dedupe_key)
         DO UPDATE SET
-            title      = EXCLUDED.title,
-            status     = 'open',
-            severity   = GREATEST(alerts.severity, EXCLUDED.severity),
-            source     = EXCLUDED.source,
-            last_seen  = GREATEST(alerts.last_seen, EXCLUDED.last_seen),
-            metadata   = EXCLUDED.metadata
+            title     = EXCLUDED.title,
+            status    = 'open',
+            severity  = GREATEST(alerts.severity, EXCLUDED.severity),
+            source    = EXCLUDED.source,
+            last_seen = GREATEST(alerts.last_seen, EXCLUDED.last_seen),
+            metadata  = EXCLUDED.metadata
         RETURNING alert_id
         """,
         (
-            dedupe_key,
-            rule_key,
-            title,
-            severity,
-            source,
-            first_seen,
-            last_seen,
+            dedupe_key, rule_key, title, severity, source,
+            first_seen, last_seen,
             json.dumps(metadata, ensure_ascii=False),
         ),
     )
@@ -108,29 +98,24 @@ def link_event(cur: PGCursor, alert_id: str, event_id: str, event_ts) -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# Règle 1 — SSH bruteforce (syslog)
+# ---------------------------------------------------------------------------
 def process_ssh_bruteforce(cur: PGCursor) -> int:
-    """
-    Détecte les bruteforce SSH depuis les logs syslog.
-
-    FIX: on exclut explicitement les événements sans IP identifiable
-    (src_ip IS NULL ET raw->>'source_ip' IS NULL) pour éviter de regrouper
-    tous les events sans IP sous la clé 'unknown' et de générer une alerte parasite.
-    """
     cur.execute(
         """
         WITH candidates AS (
             SELECT
                 COALESCE(src_ip::text, raw->>'source_ip') AS attacker_ip,
-                MIN(event_ts)  AS first_seen,
-                MAX(event_ts)  AS last_seen,
-                COUNT(*)       AS hit_count,
-                MAX(raw->>'hostname') AS hostname
+                MIN(event_ts)          AS first_seen,
+                MAX(event_ts)          AS last_seen,
+                COUNT(*)               AS hit_count,
+                MAX(raw->>'hostname')  AS hostname
             FROM events
             WHERE source = 'syslog'
               AND event_ts >= NOW() - (%s || ' minutes')::interval
               AND COALESCE(raw->>'appname', raw->>'program', '') = 'sshd'
               AND COALESCE(raw->>'message', '') ILIKE 'Failed password%%'
-              -- FIX : ignorer les events sans IP identifiable
               AND (src_ip IS NOT NULL OR raw->>'source_ip' IS NOT NULL)
             GROUP BY COALESCE(src_ip::text, raw->>'source_ip')
             HAVING COUNT(*) >= %s
@@ -150,32 +135,27 @@ def process_ssh_bruteforce(cur: PGCursor) -> int:
             "ssh_bruteforce_syslog",
             f"{attacker_ip}:{hostname or 'unknown'}",
         )
-        title = f"SSH brute force suspect depuis {attacker_ip}"
-        metadata = {
-            "rule_key": "ssh_bruteforce_syslog",
-            "attacker_ip": attacker_ip,
-            "hostname": hostname,
-            "window_minutes": SSH_BRUTEFORCE_WINDOW_MINUTES,
-            "threshold": SSH_BRUTEFORCE_THRESHOLD,
-            "hit_count": int(hit_count),
-        }
-
         alert_id = upsert_alert(
             cur,
             dedupe_key=dedupe_key,
             rule_key="ssh_bruteforce_syslog",
-            title=title,
+            title=f"SSH brute force suspect depuis {attacker_ip}",
             severity=3,
             source="syslog",
             first_seen=first_seen,
             last_seen=last_seen,
-            metadata=metadata,
+            metadata={
+                "rule_key":       "ssh_bruteforce_syslog",
+                "attacker_ip":    attacker_ip,
+                "hostname":       hostname,
+                "window_minutes": SSH_BRUTEFORCE_WINDOW_MINUTES,
+                "threshold":      SSH_BRUTEFORCE_THRESHOLD,
+                "hit_count":      int(hit_count),
+            },
         )
-
         cur.execute(
             """
-            SELECT event_id, event_ts
-            FROM events
+            SELECT event_id, event_ts FROM events
             WHERE source = 'syslog'
               AND event_ts >= NOW() - (%s || ' minutes')::interval
               AND COALESCE(src_ip::text, raw->>'source_ip') = %s
@@ -198,6 +178,9 @@ def process_ssh_bruteforce(cur: PGCursor) -> int:
     return created_or_updated
 
 
+# ---------------------------------------------------------------------------
+# Règle 2 — Suricata haute sévérité
+# ---------------------------------------------------------------------------
 def process_suricata_high_severity(cur: PGCursor) -> int:
     cur.execute(
         """
@@ -206,11 +189,11 @@ def process_suricata_high_severity(cur: PGCursor) -> int:
                 COALESCE(alert_signature, 'unknown-signature') AS signature,
                 COALESCE(src_ip::text,  'unknown-src')         AS src_ip,
                 COALESCE(dest_ip::text, 'unknown-dest')        AS dest_ip,
-                MIN(event_ts)          AS first_seen,
-                MAX(event_ts)          AS last_seen,
-                MAX(alert_severity)    AS max_severity,
-                COUNT(*)               AS hit_count,
-                MAX(alert_category)    AS category
+                MIN(event_ts)       AS first_seen,
+                MAX(event_ts)       AS last_seen,
+                MAX(alert_severity) AS max_severity,
+                COUNT(*)            AS hit_count,
+                MAX(alert_category) AS category
             FROM events
             WHERE source = 'suricata'
               AND event_ts >= NOW() - (%s || ' minutes')::interval
@@ -236,34 +219,29 @@ def process_suricata_high_severity(cur: PGCursor) -> int:
             "suricata_high_severity",
             f"{signature}:{src_ip}:{dest_ip}",
         )
-        title = f"Suricata haute sévérité : {signature}"
-        metadata = {
-            "rule_key": "suricata_high_severity",
-            "signature": signature,
-            "src_ip": src_ip,
-            "dest_ip": dest_ip,
-            "category": category,
-            "hit_count": int(hit_count),
-            "severity_threshold": SURICATA_HIGH_SEVERITY_MIN,
-        }
         severity = int(max_severity) if max_severity is not None else SURICATA_HIGH_SEVERITY_MIN
-
         alert_id = upsert_alert(
             cur,
             dedupe_key=dedupe_key,
             rule_key="suricata_high_severity",
-            title=title,
+            title=f"Suricata haute sévérité : {signature}",
             severity=severity,
             source="suricata",
             first_seen=first_seen,
             last_seen=last_seen,
-            metadata=metadata,
+            metadata={
+                "rule_key":           "suricata_high_severity",
+                "signature":          signature,
+                "src_ip":             src_ip,
+                "dest_ip":            dest_ip,
+                "category":           category,
+                "hit_count":          int(hit_count),
+                "severity_threshold": SURICATA_HIGH_SEVERITY_MIN,
+            },
         )
-
         cur.execute(
             """
-            SELECT event_id, event_ts
-            FROM events
+            SELECT event_id, event_ts FROM events
             WHERE source = 'suricata'
               AND event_ts >= NOW() - (%s || ' minutes')::interval
               AND COALESCE(alert_severity, 0) >= %s
@@ -272,13 +250,8 @@ def process_suricata_high_severity(cur: PGCursor) -> int:
               AND COALESCE(dest_ip::text, 'unknown-dest') = %s
             ORDER BY event_ts ASC
             """,
-            (
-                str(ALERT_LOOKBACK_MINUTES),
-                SURICATA_HIGH_SEVERITY_MIN,
-                signature,
-                src_ip,
-                dest_ip,
-            ),
+            (str(ALERT_LOOKBACK_MINUTES), SURICATA_HIGH_SEVERITY_MIN,
+             signature, src_ip, dest_ip),
         )
         for event_id, event_ts in cur.fetchall():
             link_event(cur, alert_id, str(event_id), event_ts)
@@ -293,16 +266,101 @@ def process_suricata_high_severity(cur: PGCursor) -> int:
     return created_or_updated
 
 
-def close_stale_alerts(cur: PGCursor) -> int:
-    """
-    FIX : délai configurable via STALE_ALERT_HOURS (défaut 24h).
-    Documenté explicitement : une attaque lente sur +24h ne sera pas
-    automatiquement fermée si STALE_ALERT_HOURS est augmenté.
-    """
+# ---------------------------------------------------------------------------
+# Règle 3 — Port scan (Suricata)
+# Sévérité adaptative : <50 ports=2, 50-99=3, 100+=4
+# ---------------------------------------------------------------------------
+def process_port_scan(cur: PGCursor) -> int:
     cur.execute(
         """
-        UPDATE alerts
-        SET status = 'closed'
+        WITH candidates AS (
+            SELECT
+                src_ip::text                        AS scanner_ip,
+                COALESCE(dest_ip::text, 'unknown')  AS target_ip,
+                COUNT(DISTINCT dest_port)            AS distinct_ports,
+                MIN(event_ts)                        AS first_seen,
+                MAX(event_ts)                        AS last_seen,
+                COUNT(*)                             AS hit_count
+            FROM events
+            WHERE source = 'suricata'
+              AND event_ts >= NOW() - (%s || ' minutes')::interval
+              AND src_ip IS NOT NULL
+              AND dest_port IS NOT NULL
+            GROUP BY src_ip::text, COALESCE(dest_ip::text, 'unknown')
+            HAVING COUNT(DISTINCT dest_port) >= %s
+        )
+        SELECT scanner_ip, target_ip, distinct_ports, first_seen, last_seen, hit_count
+        FROM candidates
+        ORDER BY distinct_ports DESC
+        """,
+        (str(PORT_SCAN_WINDOW_MINUTES), PORT_SCAN_THRESHOLD),
+    )
+
+    candidates = cur.fetchall()
+    created_or_updated = 0
+
+    for scanner_ip, target_ip, distinct_ports, first_seen, last_seen, hit_count in candidates:
+        dedupe_key = build_dedupe_key("port_scan", f"{scanner_ip}:{target_ip}")
+
+        if distinct_ports >= 100:
+            severity = 4
+        elif distinct_ports >= 50:
+            severity = 3
+        else:
+            severity = 2
+
+        alert_id = upsert_alert(
+            cur,
+            dedupe_key=dedupe_key,
+            rule_key="port_scan",
+            title=f"Scan de ports depuis {scanner_ip} vers {target_ip}",
+            severity=severity,
+            source="suricata",
+            first_seen=first_seen,
+            last_seen=last_seen,
+            metadata={
+                "rule_key":       "port_scan",
+                "scanner_ip":     scanner_ip,
+                "target_ip":      target_ip,
+                "distinct_ports": int(distinct_ports),
+                "hit_count":      int(hit_count),
+                "window_minutes": PORT_SCAN_WINDOW_MINUTES,
+                "threshold":      PORT_SCAN_THRESHOLD,
+            },
+        )
+        cur.execute(
+            """
+            SELECT event_id, event_ts FROM events
+            WHERE source = 'suricata'
+              AND event_ts >= NOW() - (%s || ' minutes')::interval
+              AND src_ip::text = %s
+              AND COALESCE(dest_ip::text, 'unknown') = %s
+              AND dest_port IS NOT NULL
+            ORDER BY event_ts ASC
+            LIMIT 500
+            """,
+            (str(PORT_SCAN_WINDOW_MINUTES), scanner_ip, target_ip),
+        )
+        for event_id, event_ts in cur.fetchall():
+            link_event(cur, alert_id, str(event_id), event_ts)
+
+        created_or_updated += 1
+        print(
+            f"[alert-worker] rule=port_scan alert_id={alert_id} "
+            f"scanner={scanner_ip} target={target_ip} ports={distinct_ports}",
+            flush=True,
+        )
+
+    return created_or_updated
+
+
+# ---------------------------------------------------------------------------
+# Maintenance
+# ---------------------------------------------------------------------------
+def close_stale_alerts(cur: PGCursor) -> int:
+    cur.execute(
+        """
+        UPDATE alerts SET status = 'closed'
         WHERE status = 'open'
           AND last_seen < NOW() - (%s || ' hours')::interval
         """,
@@ -315,8 +373,9 @@ def close_stale_alerts(cur: PGCursor) -> int:
 
 
 def run_cycle(cur: PGCursor) -> tuple[int, int]:
-    rule_hits = process_ssh_bruteforce(cur)
+    rule_hits  = process_ssh_bruteforce(cur)
     rule_hits += process_suricata_high_severity(cur)
+    rule_hits += process_port_scan(cur)
     stale_closed = close_stale_alerts(cur)
     return rule_hits, stale_closed
 
