@@ -119,6 +119,55 @@ services:
       PG_USER: ${PG_USER}
       PG_PASSWORD: ${PG_PASSWORD}
 
+  syslog-ingester:
+    build: ./services/workers
+    container_name: sentinel-syslog-ingester
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: ["python", "/app/syslog_ingester.py"]
+    environment:
+      TZ: ${TZ}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_STREAM_KEY: ${SYSLOG_STREAM_KEY}
+      REDIS_STREAM_MAXLEN: ${REDIS_STREAM_MAXLEN}
+      SYSLOG_BIND_HOST: ${SYSLOG_BIND_HOST}
+      SYSLOG_UDP_PORT: ${SYSLOG_UDP_PORT}
+      SYSLOG_TCP_PORT: ${SYSLOG_TCP_PORT}
+      SYSLOG_DEFAULT_HOSTNAME: ${SYSLOG_DEFAULT_HOSTNAME}
+    ports:
+      - "${SYSLOG_UDP_PORT}:${SYSLOG_UDP_PORT}/udp"
+      - "${SYSLOG_TCP_PORT}:${SYSLOG_TCP_PORT}/tcp"
+
+  syslog-worker:
+    build: ./services/workers
+    container_name: sentinel-syslog-worker
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      migrator:
+        condition: service_completed_successfully
+    command: ["python", "/app/syslog_worker.py"]
+    environment:
+      TZ: ${TZ}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_STREAM_KEY: ${SYSLOG_STREAM_KEY}
+      REDIS_GROUP_NAME: ${SYSLOG_GROUP_NAME}
+      REDIS_CONSUMER_NAME: ${SYSLOG_CONSUMER_NAME}
+      REDIS_READ_COUNT: ${REDIS_READ_COUNT}
+      REDIS_BLOCK_MS: ${REDIS_BLOCK_MS}
+      PG_HOST: postgres
+      PG_PORT: 5432
+      PG_DB: ${PG_DB}
+      PG_USER: ${PG_USER}
+      PG_PASSWORD: ${PG_PASSWORD}
+
   partition-manager:
     build: ./services/workers
     container_name: sentinel-partition-manager

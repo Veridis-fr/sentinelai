@@ -1,0 +1,306 @@
+import json
+import os
+import time
+from datetime import datetime, timezone
+from typing import Any, Optional
+
+import psycopg2
+import redis
+from psycopg2.extensions import connection as PGConnection
+from psycopg2.extensions import cursor as PGCursor
+
+REDIS_HOST = os.getenv("REDIS_HOST", "redis")
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+STREAM_KEY = os.getenv("REDIS_STREAM_KEY", "stream:syslog")
+GROUP_NAME = os.getenv("REDIS_GROUP_NAME", "syslog-workers")
+CONSUMER_NAME = os.getenv("REDIS_CONSUMER_NAME", "syslog-worker-1")
+READ_COUNT = int(os.getenv("REDIS_READ_COUNT", "100"))
+BLOCK_MS = int(os.getenv("REDIS_BLOCK_MS", "5000"))
+
+PG_HOST = os.getenv("PG_HOST", "postgres")
+PG_PORT = int(os.getenv("PG_PORT", "5432"))
+PG_DB = os.getenv("PG_DB", "sentinel")
+PG_USER = os.getenv("PG_USER", "sentinel")
+PG_PASSWORD = os.getenv("PG_PASSWORD", "sentinel")
+
+
+def connect_pg() -> PGConnection:
+    while True:
+        try:
+            conn = psycopg2.connect(
+                host=PG_HOST,
+                port=PG_PORT,
+                dbname=PG_DB,
+                user=PG_USER,
+                password=PG_PASSWORD,
+            )
+            conn.autocommit = False
+            print("[syslog-worker] connected to postgres", flush=True)
+            return conn
+        except Exception as exc:
+            print(f"[syslog-worker] postgres not ready: {exc}", flush=True)
+            time.sleep(2)
+
+
+def connect_redis() -> redis.Redis:
+    while True:
+        try:
+            client = redis.Redis(
+                host=REDIS_HOST,
+                port=REDIS_PORT,
+                decode_responses=True,
+            )
+            client.ping()
+            print("[syslog-worker] connected to redis", flush=True)
+            return client
+        except Exception as exc:
+            print(f"[syslog-worker] redis not ready: {exc}", flush=True)
+            time.sleep(2)
+
+
+def ensure_consumer_group(client: redis.Redis) -> None:
+    try:
+        client.xgroup_create(
+            name=STREAM_KEY,
+            groupname=GROUP_NAME,
+            id="0",
+            mkstream=True,
+        )
+        print(f"[syslog-worker] consumer group created: {GROUP_NAME}", flush=True)
+    except redis.exceptions.ResponseError as exc:
+        if "BUSYGROUP" in str(exc):
+            print(f"[syslog-worker] consumer group already exists: {GROUP_NAME}", flush=True)
+        else:
+            raise
+
+
+def parse_timestamp(value: Optional[str]) -> datetime:
+    if not value:
+        return datetime.now(timezone.utc)
+    try:
+        normalized = value.replace("Z", "+00:00")
+        return datetime.fromisoformat(normalized)
+    except Exception:
+        return datetime.now(timezone.utc)
+
+
+def safe_json_load(raw: str) -> dict:
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+    return {}
+
+
+def normalize_int(value: Any) -> Optional[int]:
+    if value in (None, "", "-"):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def build_tags(event: dict) -> list[str]:
+    tags: list[str] = ["syslog"]
+
+    transport = event.get("transport")
+    hostname = event.get("hostname")
+    appname = event.get("appname") or event.get("program")
+    severity = event.get("severity")
+    facility = event.get("facility")
+    fmt = event.get("format")
+
+    if transport:
+        tags.append(f"transport:{transport}")
+    if hostname:
+        tags.append(f"host:{hostname}")
+    if appname:
+        tags.append(f"app:{appname}")
+    if severity is not None:
+        tags.append(f"severity:{severity}")
+    if facility is not None:
+        tags.append(f"facility:{facility}")
+    if fmt:
+        tags.append(f"format:{fmt}")
+
+    return list(dict.fromkeys(tags))
+
+
+def insert_event(cur: PGCursor, message_id: str, raw: str, src_ip: Optional[str], proto: Optional[str], timestamp: Optional[str]) -> tuple[datetime, str]:
+    event = safe_json_load(raw)
+
+    event_ts = parse_timestamp(timestamp)
+    event_type = "syslog"
+
+    hostname = event.get("hostname")
+    appname = event.get("appname") or event.get("program")
+    severity = normalize_int(event.get("severity"))
+    message = event.get("message")
+
+    tags = build_tags(event)
+
+    alert_signature = appname
+    alert_category = hostname
+    alert_severity = severity
+
+    enriched_raw = json.dumps(
+        {
+            **event,
+            "normalized": {
+                "source": "syslog",
+                "event_type": "syslog",
+                "hostname": hostname,
+                "appname": appname,
+                "severity": severity,
+                "message": message,
+            },
+        },
+        ensure_ascii=False,
+    )
+
+    cur.execute(
+        """
+        INSERT INTO events (
+            source_event_id,
+            event_ts,
+            source,
+            event_type,
+            src_ip,
+            dest_ip,
+            src_port,
+            dest_port,
+            proto,
+            app_proto,
+            flow_id,
+            alert_signature,
+            alert_category,
+            alert_severity,
+            tags,
+            raw
+        )
+        VALUES (
+            %s,
+            %s,
+            'syslog',
+            %s,
+            %s,
+            NULL,
+            NULL,
+            NULL,
+            %s,
+            %s,
+            NULL,
+            %s,
+            %s,
+            %s,
+            %s,
+            %s::jsonb
+        )
+        ON CONFLICT (event_ts, source, source_event_id) DO NOTHING
+        """,
+        (
+            message_id,
+            event_ts,
+            event_type,
+            src_ip if src_ip else None,
+            proto if proto else None,
+            appname,
+            alert_signature,
+            alert_category,
+            alert_severity,
+            tags,
+            enriched_raw,
+        ),
+    )
+
+    return event_ts, event_type
+
+
+def read_batch(client: redis.Redis, stream_id: str) -> list[tuple[str, dict[str, str]]]:
+    response = client.xreadgroup(
+        groupname=GROUP_NAME,
+        consumername=CONSUMER_NAME,
+        streams={STREAM_KEY: stream_id},
+        count=READ_COUNT,
+        block=BLOCK_MS,
+    )
+    if not response:
+        return []
+
+    messages: list[tuple[str, dict[str, str]]] = []
+    for _, batch in response:
+        for message_id, fields in batch:
+            messages.append((message_id, fields))
+    return messages
+
+
+def process_messages(client: redis.Redis, conn: PGConnection, messages: list[tuple[str, dict[str, str]]]) -> int:
+    processed = 0
+
+    with conn.cursor() as cur:
+        for message_id, fields in messages:
+            raw = fields.get("raw", "{}")
+            src_ip = fields.get("src_ip")
+            proto = fields.get("proto")
+            timestamp = fields.get("timestamp")
+
+            try:
+                event_ts, event_type = insert_event(cur, message_id, raw, src_ip, proto, timestamp)
+                conn.commit()
+                client.xack(STREAM_KEY, GROUP_NAME, message_id)
+                processed += 1
+                print(
+                    f"[syslog-worker] acked id={message_id} event_ts={event_ts.isoformat()} event_type={event_type}",
+                    flush=True,
+                )
+            except Exception as exc:
+                conn.rollback()
+                print(f"[syslog-worker] failed id={message_id}: {exc}", flush=True)
+
+    return processed
+
+
+def main() -> None:
+    client = connect_redis()
+    conn = connect_pg()
+    ensure_consumer_group(client)
+
+    print(
+        f"[syslog-worker] stream={STREAM_KEY} group={GROUP_NAME} consumer={CONSUMER_NAME}",
+        flush=True,
+    )
+
+    while True:
+        try:
+            pending_messages = read_batch(client, "0")
+            if pending_messages:
+                process_messages(client, conn, pending_messages)
+                continue
+
+            new_messages = read_batch(client, ">")
+            if not new_messages:
+                continue
+
+            process_messages(client, conn, new_messages)
+
+        except (psycopg2.OperationalError, psycopg2.InterfaceError) as exc:
+            print(f"[syslog-worker] postgres connection lost: {exc}", flush=True)
+            time.sleep(2)
+            conn = connect_pg()
+
+        except (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError) as exc:
+            print(f"[syslog-worker] redis connection lost: {exc}", flush=True)
+            time.sleep(2)
+            client = connect_redis()
+            ensure_consumer_group(client)
+
+        except Exception as exc:
+            print(f"[syslog-worker] unexpected error: {exc}", flush=True)
+            time.sleep(2)
+
+
+if __name__ == "__main__":
+    main()
