@@ -210,6 +210,7 @@ services:
       SSH_BRUTEFORCE_WINDOW_MINUTES: ${SSH_BRUTEFORCE_WINDOW_MINUTES}
       SSH_BRUTEFORCE_THRESHOLD: ${SSH_BRUTEFORCE_THRESHOLD}
       SURICATA_HIGH_SEVERITY_MIN: ${SURICATA_HIGH_SEVERITY_MIN}
+      STALE_ALERT_HOURS: ${STALE_ALERT_HOURS}
 
   api:
     build: ./services/api
@@ -227,8 +228,12 @@ services:
       PG_DB: ${PG_DB}
       PG_USER: ${PG_USER}
       PG_PASSWORD: ${PG_PASSWORD}
+      PG_POOL_MIN: ${PG_POOL_MIN}
+      PG_POOL_MAX: ${PG_POOL_MAX}
+      CORS_ORIGINS: ${CORS_ORIGINS}
+      WS_PUSH_INTERVAL_SECONDS: ${WS_PUSH_INTERVAL_SECONDS}
     ports:
-      - "8000:8000"
+      - "8000:8000" 
 
   frontend:
     build: ./services/frontend
