@@ -1,0 +1,82 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: sentinel-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: sentinel
+      POSTGRES_USER: sentinel
+      POSTGRES_PASSWORD: sentinel
+    volumes:
+      - ./services/postgres/data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  migrator:
+    image: postgres:16
+    container_name: sentinel-migrator
+    depends_on:
+      - postgres
+    volumes:
+      - ./services/postgres/migrations:/migrations:ro
+    environment:
+      PGPASSWORD: sentinel
+    entrypoint: >
+      sh -c "
+      until pg_isready -h postgres -U sentinel -d sentinel; do
+        echo 'waiting for postgres...';
+        sleep 2;
+      done;
+      for f in /migrations/*.sql; do
+        echo 'applying migration:' $$f;
+        psql -h postgres -U sentinel -d sentinel -f $$f;
+      done;
+      echo 'migrations done';
+      "
+
+  redis:
+    image: redis:7
+    container_name: sentinel-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+
+  suricata:
+    image: jasonish/suricata:latest
+    container_name: sentinel-suricata
+    restart: unless-stopped
+    network_mode: "host"
+    command: >
+      suricata -i eth0 -l /var/log/suricata
+    volumes:
+      - ./services/suricata/logs:/var/log/suricata
+
+  suricata-ingester:
+    build: ./services/workers
+    container_name: sentinel-suricata-ingester
+    restart: unless-stopped
+    depends_on:
+      - redis
+      - suricata
+    command: ["python", "/app/suricata_ingester.py"]
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+    volumes:
+      - ./services/suricata/logs:/logs:ro
+
+  suricata-worker:
+    build: ./services/workers
+    container_name: sentinel-suricata-worker
+    restart: unless-stopped
+    depends_on:
+      - redis
+      - migrator
+    command: ["python", "/app/suricata_worker.py"]
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      PG_HOST: postgres
+      PG_DB: sentinel
+      PG_USER: sentinel
+      PG_PASSWORD: sentinel
