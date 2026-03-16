@@ -1,276 +1,210 @@
 # SentinelAI
 
-Lightweight SIEM and detection pipeline built around a modern streaming architecture.
+Appliance de cyberdéfense autonome pour PME — pipeline de détection moderne basé sur une architecture streaming.
 
-SentinelAI ingests security telemetry (IDS and Syslog), processes it through Redis Streams, stores normalized events in PostgreSQL, and performs correlation to generate actionable alerts.
-
-The project is designed as a **modular detection pipeline** that can later integrate machine learning detection and behavioral analysis.
+SentinelAI ingère la télémétrie réseau (Suricata IDS + Syslog), la traite via Redis Streams, stocke les événements normalisés dans PostgreSQL, corrèle les alertes et les expose sur un dashboard SOC temps réel.
 
 ---
 
-# Architecture
+## Architecture
 
-SentinelAI follows a streaming security pipeline:
-
-Suricata
-      │
-      │
-      ├──> Redis Streams ──> Workers ──> PostgreSQL (partitioned)
-      │
-Syslog ┘
-
-            ↓
-
-      Alert Correlation Engine
-
-            ↓
-
-        FastAPI API
-
-            ↓
-
-       SOC Dashboard
+```
+Suricata IDS ──┐
+               ├──> Redis Streams ──> Workers Python ──> PostgreSQL (partitionné par mois)
+Syslog UDP/TCP─┘
+                                            │
+                                    Alert Worker (règles)
+                                            │
+                                       FastAPI + WebSocket
+                                            │
+                                      Dashboard React (Live)
+```
 
 ---
 
-# Features
+## Fonctionnalités
 
-Current capabilities (Phase 4)
+### Ingestion
+- Suricata IDS — lecture temps réel du fichier `eve.json` avec détection de rotation
+- Syslog — réception UDP et TCP sur port 5514
+- Redis Streams comme bus d'événements unique avec consumer groups
+- Gestion automatique des null bytes et caractères invalides
 
-### Event Ingestion
-- Suricata IDS alert ingestion
-- Syslog ingestion (UDP and TCP)
-- Redis Streams event transport
+### Stockage
+- Table `events` partitionnée par mois (PostgreSQL natif)
+- Table `alerts` avec déduplication par `dedupe_key`
+- Table `alert_events` pour la liaison événements ↔ alertes
+- Table `baselines` pour le versionnage des modèles ML (Phase 4)
+- Table `feedback` pour la vérité terrain opérateur
+- Création automatique des partitions mensuelles via `partition_manager`
 
-### Event Storage
-- Unified `events` table
-- PostgreSQL partitioned by time
-- JSONB raw event storage
-
-### Detection
-- Rule-based correlation engine
-- Example detection: SSH brute force
+### Détection (3 règles actives)
+- **SSH Bruteforce** — N échecs SSH depuis la même IP sur une fenêtre configurable (syslog)
+- **Suricata haute sévérité** — alertes Suricata au-dessus d'un seuil de sévérité configurable
+- **Port scan** — IP source contactant N ports distincts en moins de X minutes (sévérité adaptative)
 
 ### API
-- FastAPI service
-- Query events and alerts
-- Health monitoring endpoint
+- FastAPI avec connection pool PostgreSQL
+- WebSocket `/ws/alerts` — push temps réel des alertes
+- Endpoints : `/health`, `/events`, `/alerts`, `/alerts/{id}/events`, `/stats`
+- CORS configurable
 
 ### Dashboard
-- React SOC dashboard
-- Alert inspection
-- Event timeline
-- Basic filtering
+- Badge Live WebSocket (vert/orange/rouge)
+- KPI temps réel depuis `/stats` (vrais totaux, pas estimations)
+- Top IPs attaquantes
+- Onglet Stats — alertes par règle, par sévérité, timeline 24h
+- Filtres source / statut / recherche
+- Détail alerte avec événements corrélés et métadonnées
 
 ---
 
-# Technology Stack
+## Stack technique
 
-Backend
-
-Python  
-FastAPI  
-Redis Streams  
-PostgreSQL  
-Suricata IDS  
-Docker Compose  
-
-Frontend
-
-React  
-Vite  
-SOC-style dashboard  
+| Composant | Technologie |
+|---|---|
+| Ingestion | Python 3.11 |
+| Transport | Redis 7 Streams |
+| Stockage | PostgreSQL 16 (partitionné) |
+| IDS | Suricata |
+| API | FastAPI + uvicorn |
+| Temps réel | WebSocket (uvicorn native) |
+| Frontend | React 18 + TypeScript + Vite |
+| Reverse proxy | nginx |
+| Orchestration | Docker Compose |
 
 ---
 
-# Project Structure
+## Structure du projet
 
-sentinelai
-
-docker-compose.yml
-
-migrations  
-SQL schema
-
-services  
-
-suricata-ingester  
-ingests Suricata alerts  
-
-suricata-worker  
-normalizes and stores Suricata events  
-
-syslog-ingester  
-receives Syslog events  
-
-syslog-worker  
-normalizes Syslog logs  
-
-workers  
-alert correlation engine  
-
-api  
-FastAPI detection API  
-
-frontend  
-SOC dashboard  
+```
+sentinelai/
+├── docker-compose.yml
+├── .env.example
+├── services/
+│   ├── postgres/
+│   │   └── migrations/
+│   │       ├── 001_init_schema.sql      # events, alerts, alert_events, baselines, feedback
+│   │       ├── 002_alerting.sql         # dedupe_key, index composites
+│   │       └── 002_create_initial_partitions.sql
+│   ├── workers/
+│   │   ├── suricata_ingester.py         # lecture eve.json → Redis Streams
+│   │   ├── suricata_worker.py           # Redis → PostgreSQL (Suricata)
+│   │   ├── syslog_ingester.py           # UDP/TCP → Redis Streams
+│   │   ├── syslog_worker.py             # Redis → PostgreSQL (Syslog)
+│   │   ├── alert_worker.py              # moteur de règles + corrélation
+│   │   └── partition_manager.py        # création automatique des partitions
+│   ├── api/
+│   │   └── main.py                     # FastAPI + WebSocket + connection pool
+│   └── frontend/
+│       └── src/
+│           └── App.tsx                 # Dashboard React temps réel
+```
 
 ---
 
-# Data Model
+## Installation
 
-Unified event model
-
-event_ts — timestamp  
-source — suricata or syslog  
-event_type — normalized event type  
-src_ip — source IP  
-dest_ip — destination IP  
-alert_signature — IDS signature  
-tags — event tags  
-raw — full JSON payload  
-
-This design enables
-
-- unified correlation
-- flexible parsing
-- ML integration later
-
----
-
-# Example Detection
-
-Current implemented rule
-
-SSH Brute Force
-
-Triggered when multiple syslog entries contain
-
-Failed password for invalid user
-
-within a short time window.
-
-Example alert
-
-SSH brute force suspect depuis 172.20.0.1
-
----
-
-# Running SentinelAI
-
-Start the full stack
-
+```bash
+git clone https://github.com/Veridis-fr/sentinelai
+cd sentinelai
+cp .env.example .env
+# Éditer .env selon votre environnement (interface réseau, credentials, etc.)
 docker compose up -d --build
+```
 
-Services started
+### Accès
 
-API — 8000  
-PostgreSQL — 5432  
-Redis — 6379  
-Dashboard — 5173  
-
----
-
-# API Endpoints
-
-Health
-
-/health
-
-Events
-
-/events
-
-Alerts
-
-/alerts
-
-Alert details
-
-/alerts/{alert_id}/events
-
-Interactive documentation
-
-http://SERVER_IP:8000/docs
+| Service | URL |
+|---|---|
+| Dashboard | `http://SERVER_IP` |
+| API | `http://SERVER_IP:8000` |
+| Documentation API | `http://SERVER_IP:8000/docs` |
 
 ---
 
-# Dashboard
+## Configuration
 
-Access the SOC dashboard
+Variables clés dans `.env` :
 
-http://SERVER_IP:5173
+```bash
+SURICATA_INTERFACE=eth0          # Interface réseau à surveiller
 
-Features
+# Règles de détection
+SSH_BRUTEFORCE_THRESHOLD=5       # Nombre d'échecs SSH pour déclencher une alerte
+SSH_BRUTEFORCE_WINDOW_MINUTES=5  # Fenêtre de temps
+PORT_SCAN_THRESHOLD=20           # Ports distincts pour déclencher port scan
+PORT_SCAN_WINDOW_MINUTES=2
 
-- Alerts list
-- Alert investigation panel
-- Event feed
-- Filtering by source
+# Pool de connexions API
+PG_POOL_MIN=2
+PG_POOL_MAX=10
 
----
-
-# Project Goals
-
-SentinelAI aims to explore modern detection pipelines built on
-
-- streaming architectures
-- unified event storage
-- scalable correlation
-- machine learning assisted detection
-
-Future work will include
-
-- behavioral baselines
-- anomaly detection
-- clustering of events
-- detection automation
+# WebSocket
+WS_PUSH_INTERVAL_SECONDS=5
+```
 
 ---
 
-# Development Status
+## Modèle de données
 
-Version
-
-v1.0 — Phase 4 complete
-
-Completed phases
-
-Phase 1 — Infrastructure stack  
-Phase 2 — Suricata ingestion pipeline  
-Phase 3 — Syslog ingestion pipeline  
-Phase 4 — Detection engine + API + dashboard  
+```sql
+events        -- événements bruts normalisés, partitionné par event_ts
+alerts        -- alertes corrélées avec déduplication
+alert_events  -- liaison N-N alertes ↔ événements, partitionné
+baselines     -- modèles ML versionnés (Phase 4)
+feedback      -- vérité terrain opérateur (TP/FP)
+```
 
 ---
 
-# Future Roadmap
+## Statut du projet
 
-Phase 5
-
-- Dockerized dashboard
-- reverse proxy
-- real time metrics
-
-Phase 6
-
-- ML detection models
-- anomaly detection
-- event clustering
-
----
-
-# License
-
-MIT
+| Phase | Description | Statut |
+|---|---|---|
+| Phase 0 | Socle infra Docker + PostgreSQL partitionné | ✅ |
+| Phase 1 | Pipeline Suricata → Redis → PostgreSQL | ✅ |
+| Phase 2 | Ingestion Syslog + Filebeat | ✅ |
+| Phase 3 | Règles déterministes + Dashboard V1 | ✅ |
+| Phase 3.5 | WebSocket temps réel + API stats + polish UI | ✅ |
+| Phase 4 | IsolationForest + corrélation incidents | 🔄 Baseline en cours |
+| Phase 5 | LLM co-pilote (Ollama local) | ⏳ |
+| Phase 6 | Hardening + packaging + script install | ⏳ |
 
 ---
 
-# Author
+## Roadmap Phase 4
 
-Valentin Delamare
+- Entraînement IsolationForest sur baseline 2 semaines minimum
+- Table `feedback` pour réentraînement supervisé
+- Corrélation temporelle simple (même IP, même type, fenêtre 5 min = 1 incident)
+- Scoring de risque
 
-GitHub
+## Roadmap Phase 5
 
-https://github.com/Veridis-fr
+- Ollama local (Mistral 7B quantisé)
+- Flag `AI_EXPLAINER_ENABLED` — optionnel, les logs ne quittent pas l'appliance
+- Explication incidents en langage naturel pour opérateur PME
 
-SentinelAI is an experimental detection platform created to explore SIEM architecture and cybersecurity telemetry processing.
+## Roadmap Phase 6
+
+- PostgreSQL et Redis sur `127.0.0.1` uniquement
+- Authentification dashboard
+- CORS restrictif
+- Script d'installation one-liner
+- Documentation utilisateur
+
+---
+
+## Auteur
+
+**Valentin Delamare**
+GitHub — [Veridis-fr](https://github.com/Veridis-fr)
+
+SentinelAI est une appliance de cyberdéfense open-source conçue pour rendre la détection de menaces accessible aux PME sans infrastructure SOC dédiée.
+
+---
+
+## Licence
+
+MIT	
