@@ -4,50 +4,70 @@ services:
     container_name: sentinel-postgres
     restart: unless-stopped
     environment:
-      POSTGRES_DB: sentinel
-      POSTGRES_USER: sentinel
-      POSTGRES_PASSWORD: sentinel
+      POSTGRES_DB: ${PG_DB}
+      POSTGRES_USER: ${PG_USER}
+      POSTGRES_PASSWORD: ${PG_PASSWORD}
+      TZ: ${TZ}
+      PGTZ: ${TZ}
     volumes:
       - ./services/postgres/data:/var/lib/postgresql/data
     ports:
-      - "5432:5432"
+      - "${PG_PORT}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PG_USER} -d ${PG_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
 
   migrator:
     image: postgres:16
     container_name: sentinel-migrator
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGPORT: 5432
+      PGDATABASE: ${PG_DB}
+      PGUSER: ${PG_USER}
+      PGPASSWORD: ${PG_PASSWORD}
+      TZ: ${TZ}
     volumes:
       - ./services/postgres/migrations:/migrations:ro
-    environment:
-      PGPASSWORD: sentinel
-    entrypoint: >
-      sh -c "
-      until pg_isready -h postgres -U sentinel -d sentinel; do
-        echo 'waiting for postgres...';
-        sleep 2;
-      done;
-      for f in /migrations/*.sql; do
-        echo 'applying migration:' $$f;
-        psql -h postgres -U sentinel -d sentinel -f $$f;
-      done;
-      echo 'migrations done';
-      "
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        for f in /migrations/*.sql; do
+          echo "[migrator] applying $$f"
+          psql -v ON_ERROR_STOP=1 -f "$$f"
+        done
+        echo "[migrator] done"
 
   redis:
     image: redis:7
     container_name: sentinel-redis
     restart: unless-stopped
     ports:
-      - "6379:6379"
+      - "${REDIS_PORT}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
 
   suricata:
     image: jasonish/suricata:latest
     container_name: sentinel-suricata
     restart: unless-stopped
-    network_mode: "host"
-    command: >
-      suricata -i eth0 -l /var/log/suricata
+    network_mode: host
+    command:
+      - suricata
+      - -i
+      - ${SURICATA_INTERFACE}
+      - -l
+      - /var/log/suricata
     volumes:
       - ./services/suricata/logs:/var/log/suricata
 
@@ -56,27 +76,69 @@ services:
     container_name: sentinel-suricata-ingester
     restart: unless-stopped
     depends_on:
-      - redis
-      - suricata
+      redis:
+        condition: service_healthy
+      suricata:
+        condition: service_started
     command: ["python", "/app/suricata_ingester.py"]
     environment:
+      TZ: ${TZ}
       REDIS_HOST: redis
-      REDIS_PORT: "6379"
+      REDIS_PORT: 6379
+      REDIS_STREAM_KEY: ${REDIS_STREAM_KEY}
+      REDIS_STREAM_MAXLEN: ${REDIS_STREAM_MAXLEN}
+      SURICATA_EVE_FILE: /logs/eve.json
+      INGEST_POLL_INTERVAL: ${INGEST_POLL_INTERVAL}
     volumes:
-      - ./services/suricata/logs:/logs:ro
+      - ./services/suricata/logs:/logs
 
   suricata-worker:
     build: ./services/workers
     container_name: sentinel-suricata-worker
     restart: unless-stopped
     depends_on:
-      - redis
-      - migrator
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      migrator:
+        condition: service_completed_successfully
     command: ["python", "/app/suricata_worker.py"]
     environment:
+      TZ: ${TZ}
       REDIS_HOST: redis
-      REDIS_PORT: "6379"
+      REDIS_PORT: 6379
+      REDIS_STREAM_KEY: ${REDIS_STREAM_KEY}
+      REDIS_GROUP_NAME: ${REDIS_GROUP_NAME}
+      REDIS_CONSUMER_NAME: ${REDIS_CONSUMER_NAME}
+      REDIS_READ_COUNT: ${REDIS_READ_COUNT}
+      REDIS_BLOCK_MS: ${REDIS_BLOCK_MS}
       PG_HOST: postgres
-      PG_DB: sentinel
-      PG_USER: sentinel
-      PG_PASSWORD: sentinel
+      PG_PORT: 5432
+      PG_DB: ${PG_DB}
+      PG_USER: ${PG_USER}
+      PG_PASSWORD: ${PG_PASSWORD}
+
+  partition-manager:
+    build: ./services/workers
+    container_name: sentinel-partition-manager
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrator:
+        condition: service_completed_successfully
+    command: ["python", "/app/partition_manager.py"]
+    environment:
+      TZ: ${TZ}
+      PG_HOST: postgres
+      PG_PORT: 5432
+      PG_DB: ${PG_DB}
+      PG_USER: ${PG_USER}
+      PG_PASSWORD: ${PG_PASSWORD}
+      PARTITION_LOOKAHEAD_MONTHS: ${PARTITION_LOOKAHEAD_MONTHS}
+      PARTITION_CHECK_INTERVAL_SECONDS: ${PARTITION_CHECK_INTERVAL_SECONDS}
+
+networks:
+  default:
+    name: sentinel-network

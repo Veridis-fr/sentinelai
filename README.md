@@ -1,25 +1,38 @@
 # SentinelAI
 
-SentinelAI is a modular detection and threat analysis platform built step by step from a clean infrastructure-first approach.
+SentinelAI is a modular detection and threat analysis platform built step by step with an infrastructure-first approach.
 
 ## Current status
-Phase 1 completed:
-- Docker Compose base stack
-- Suricata ingestion
-- Redis-based event transport
-- Python workers
-- PostgreSQL persistence layer
 
-## Architecture
-Suricata → Python Ingester → Redis / Worker pipeline → PostgreSQL
+### Phase 1.1 in progress
+This repository currently provides:
+
+- PostgreSQL persistence with monthly partitioned event storage
+- Redis Streams transport layer
+- Suricata log ingestion from `eve.json`
+- Python workers for ingestion, stream consumption, and partition management
+- Docker Compose stack for local end-to-end validation
+
+## Current data flow
+
+Suricata -> Python Ingester -> Redis Streams -> Python Worker -> PostgreSQL
 
 ## Project structure
-- `services/suricata/` : Suricata configuration and rules
-- `services/workers/` : ingestion and processing workers
-- `services/postgres/` : database init and migrations
-- `services/redis/` : Redis service
-- `configs/` : shared configuration files
-- `scripts/` : helper scripts
 
-## Goal
-Build a scalable SOC-oriented detection platform before adding higher-level detection logic, API, or frontend.
+```text
+.
+├── docker-compose.yml
+├── .env.example
+├── README.md
+└── services
+    ├── postgres
+    │   ├── data/
+    │   └── migrations/
+    ├── suricata
+    │   └── logs/
+    └── workers
+        ├── Dockerfile
+        ├── requirements.txt
+        ├── suricata_ingester.py
+        ├── suricata_worker.py
+        └── partition_manager.py
