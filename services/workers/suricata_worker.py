@@ -232,17 +232,27 @@ def read_batch(
     return messages
 
 
+MAX_RETRY_BEFORE_SKIP = 3
+_fail_counts: dict[str, int] = {}
+
+
+def sanitize_raw(raw: str) -> str:
+    # Supprime les null bytes que PostgreSQL refuse dans le JSONB
+    return raw.replace("\\u0000", "").replace("\x00", "")
+
+
 def process_messages(client: redis.Redis, conn: PGConnection, messages: list[tuple[str, dict[str, str]]]) -> int:
     processed = 0
 
     with conn.cursor() as cur:
         for message_id, fields in messages:
-            raw = fields.get("raw", "{}")
+            raw = sanitize_raw(fields.get("raw", "{}"))
 
             try:
                 event_ts, event_type = insert_event(cur, message_id, raw)
                 conn.commit()
                 client.xack(STREAM_KEY, GROUP_NAME, message_id)
+                _fail_counts.pop(message_id, None)
                 processed += 1
                 print(
                     f"[worker] acked id={message_id} event_ts={event_ts.isoformat()} "
@@ -251,7 +261,14 @@ def process_messages(client: redis.Redis, conn: PGConnection, messages: list[tup
                 )
             except Exception as exc:
                 conn.rollback()
-                print(f"[worker] failed id={message_id}: {exc}", flush=True)
+                _fail_counts[message_id] = _fail_counts.get(message_id, 0) + 1
+                if _fail_counts[message_id] >= MAX_RETRY_BEFORE_SKIP:
+                    # Message irrécupérable — on ack pour débloquer la queue
+                    client.xack(STREAM_KEY, GROUP_NAME, message_id)
+                    _fail_counts.pop(message_id, None)
+                    print(f"[worker] skipped id={message_id} after {MAX_RETRY_BEFORE_SKIP} failures: {exc}", flush=True)
+                else:
+                    print(f"[worker] failed id={message_id} attempt={_fail_counts[message_id]}: {exc}", flush=True)
 
     return processed
 
