@@ -188,6 +188,29 @@ services:
       PARTITION_LOOKAHEAD_MONTHS: ${PARTITION_LOOKAHEAD_MONTHS}
       PARTITION_CHECK_INTERVAL_SECONDS: ${PARTITION_CHECK_INTERVAL_SECONDS}
 
+  alert-worker:
+    build: ./services/workers
+    container_name: sentinel-alert-worker
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrator:
+        condition: service_completed_successfully
+    command: ["python", "/app/alert_worker.py"]
+    environment:
+      TZ: ${TZ}
+      PG_HOST: postgres
+      PG_PORT: 5432
+      PG_DB: ${PG_DB}
+      PG_USER: ${PG_USER}
+      PG_PASSWORD: ${PG_PASSWORD}
+      ALERT_POLL_INTERVAL_SECONDS: ${ALERT_POLL_INTERVAL_SECONDS}
+      ALERT_LOOKBACK_MINUTES: ${ALERT_LOOKBACK_MINUTES}
+      SSH_BRUTEFORCE_WINDOW_MINUTES: ${SSH_BRUTEFORCE_WINDOW_MINUTES}
+      SSH_BRUTEFORCE_THRESHOLD: ${SSH_BRUTEFORCE_THRESHOLD}
+      SURICATA_HIGH_SEVERITY_MIN: ${SURICATA_HIGH_SEVERITY_MIN}
+
 networks:
   default:
     name: sentinel-network
