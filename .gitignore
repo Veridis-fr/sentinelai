@@ -22,3 +22,6 @@ dump.rdb
 .vscode/
 .idea/
 .DS_Store
+services/suricata/rules/suricata.rules
+services/suricata/rules/suricata.rules
+services/suricata/rules/suricata.rules
