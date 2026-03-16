@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import "./App.css";
 
-const API_BASE = "http://172.19.124.94:8000";
+const API_BASE = "/api";
 
 type HealthResponse = {
   status: string;
