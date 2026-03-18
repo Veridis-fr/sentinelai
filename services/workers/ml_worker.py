@@ -322,7 +322,7 @@ def already_scored(conn: PGConnection, event_ids: list[str]) -> set[str]:
         return set()
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT event_id::text FROM ml_scores WHERE event_id = ANY(%s)",
+            "SELECT event_id::text FROM ml_scores WHERE event_id::text = ANY(%s)",
             (event_ids,),
         )
         return {str(r[0]) for r in cur.fetchall()}
@@ -438,7 +438,7 @@ def detect_cycle(
     if not events:
         return 0
 
-    # Filtrer les events déjà scorés
+   # Filtrer les events déjà scorés
     event_ids = [str(e["event_id"]) for e in events]
     scored_ids = already_scored(conn, event_ids)
     events = [e for e in events if str(e["event_id"]) not in scored_ids]
@@ -525,8 +525,13 @@ def main() -> None:
 
         except Exception as exc:
             print(f"[ml-worker] unexpected error: {exc}", flush=True)
+            try:
+                conn.rollback()
+            except Exception:
+                pass
             time.sleep(5)
 
 
 if __name__ == "__main__":
     main()
+
