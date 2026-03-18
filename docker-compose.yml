@@ -214,7 +214,35 @@ services:
       PORT_SCAN_WINDOW_MINUTES: ${PORT_SCAN_WINDOW_MINUTES}
       PORT_SCAN_THRESHOLD: ${PORT_SCAN_THRESHOLD}
 
-  api:
+  ml-worker:
+    build: ./services/workers
+    container_name: sentinel-ml-worker
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrator:
+        condition: service_completed_successfully
+    command: ["python", "/app/ml_worker.py"]
+    environment:
+      TZ: ${TZ}
+      PG_HOST: postgres
+      PG_PORT: 5432
+      PG_DB: ${PG_DB}
+      PG_USER: ${PG_USER}
+      PG_PASSWORD: ${PG_PASSWORD}
+      ML_TRAIN_LOOKBACK_HOURS: ${ML_TRAIN_LOOKBACK_HOURS}
+      ML_TRAIN_MIN_EVENTS: ${ML_TRAIN_MIN_EVENTS}
+      ML_N_ESTIMATORS: ${ML_N_ESTIMATORS}
+      ML_CONTAMINATION: ${ML_CONTAMINATION}
+      ML_FORCE_TRAIN: ${ML_FORCE_TRAIN}
+      ML_DETECT_POLL_SECONDS: ${ML_DETECT_POLL_SECONDS}
+      ML_DETECT_LOOKBACK_MINUTES: ${ML_DETECT_LOOKBACK_MINUTES}
+      ML_ANOMALY_THRESHOLD: ${ML_ANOMALY_THRESHOLD}
+      ML_ALERT_MIN_SCORE: ${ML_ALERT_MIN_SCORE}
+      ML_ALERT_COOLDOWN_MINUTES: ${ML_ALERT_COOLDOWN_MINUTES}
+
+
     build: ./services/api
     container_name: sentinel-api
     restart: unless-stopped
