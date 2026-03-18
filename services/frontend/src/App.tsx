@@ -230,7 +230,21 @@ export default function App() {
     }
   }, []);
 
-  useEffect(() => { void loadDashboard(); }, [loadDashboard]);
+useEffect(() => {
+  void loadDashboard();
+  const interval = setInterval(async () => {
+    try {
+      const [healthData, statsData] = await Promise.all([
+        apiGet<HealthResponse>("/health"),
+        apiGet<StatsResponse>("/stats"),
+      ]);
+      setHealth(healthData);
+      setStats(statsData);
+      setLastUpdate(new Date());
+    } catch { /* silencieux */ }
+  }, 30000);
+  return () => clearInterval(interval);
+}, [loadDashboard]);
 
   // Sélectionner la première alerte quand elles arrivent via WS
   useEffect(() => {
