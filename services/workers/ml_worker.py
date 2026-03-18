@@ -404,6 +404,7 @@ def create_ml_alert(conn: PGConnection, event: dict, score: float, baseline_id: 
                 last_seen = GREATEST(alerts.last_seen, EXCLUDED.last_seen),
                 severity  = GREATEST(alerts.severity, EXCLUDED.severity),
                 metadata  = EXCLUDED.metadata
+            RETURNING alert_id
             """,
             (
                 dedupe_key,
@@ -415,6 +416,17 @@ def create_ml_alert(conn: PGConnection, event: dict, score: float, baseline_id: 
                 json.dumps(metadata),
             ),
         )
+        row = cur.fetchone()
+        if row:
+            alert_id = str(row[0])
+            cur.execute(
+                """
+                INSERT INTO alert_events (alert_id, event_id, event_ts)
+                VALUES (%s, %s, %s)
+                ON CONFLICT DO NOTHING
+                """,
+                (alert_id, str(event["event_id"]), event["event_ts"]),
+            )
 
     conn.commit()
     set_cooldown(cooldown_key)
@@ -438,7 +450,7 @@ def detect_cycle(
     if not events:
         return 0
 
-   # Filtrer les events déjà scorés
+    # Filtrer les events déjà scorés
     event_ids = [str(e["event_id"]) for e in events]
     scored_ids = already_scored(conn, event_ids)
     events = [e for e in events if str(e["event_id"]) not in scored_ids]
@@ -534,4 +546,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
