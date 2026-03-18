@@ -242,7 +242,7 @@ services:
       ML_ALERT_MIN_SCORE: ${ML_ALERT_MIN_SCORE}
       ML_ALERT_COOLDOWN_MINUTES: ${ML_ALERT_COOLDOWN_MINUTES}
 
-
+  api:
     build: ./services/api
     container_name: sentinel-api
     restart: unless-stopped
@@ -263,7 +263,7 @@ services:
       CORS_ORIGINS: ${CORS_ORIGINS}
       WS_PUSH_INTERVAL_SECONDS: ${WS_PUSH_INTERVAL_SECONDS}
     ports:
-      - "8000:8000" 
+      - "8000:8000"
 
   frontend:
     build: ./services/frontend
