@@ -1,8 +1,8 @@
 # SentinelAI
 
-Appliance de cyberdéfense autonome pour PME — pipeline de détection moderne basé sur une architecture streaming.
+Autonomous cybersecurity appliance for SMEs — a modern streaming-based detection pipeline.
 
-SentinelAI ingère la télémétrie réseau (Suricata IDS + Syslog), la traite via Redis Streams, stocke les événements normalisés dans PostgreSQL, corrèle les alertes et les expose sur un dashboard SOC temps réel.
+SentinelAI ingests network telemetry (Suricata IDS + Syslog), processes it through Redis Streams, stores normalized events in PostgreSQL, correlates alerts using both deterministic rules and machine learning, and exposes everything on a real-time SOC dashboard.
 
 ---
 
@@ -10,72 +10,83 @@ SentinelAI ingère la télémétrie réseau (Suricata IDS + Syslog), la traite v
 
 ```
 Suricata IDS ──┐
-               ├──> Redis Streams ──> Workers Python ──> PostgreSQL (partitionné par mois)
+               ├──> Redis Streams ──> Python Workers ──> PostgreSQL (monthly partitioned)
 Syslog UDP/TCP─┘
                                             │
-                                    Alert Worker (règles)
+                                    Alert Worker (rules engine)
+                                    ML Worker (IsolationForest)
                                             │
                                        FastAPI + WebSocket
                                             │
-                                      Dashboard React (Live)
+                                    React SOC Dashboard (Live)
 ```
 
 ---
 
-## Fonctionnalités
+## Features
 
 ### Ingestion
-- Suricata IDS — lecture temps réel du fichier `eve.json` avec détection de rotation
-- Syslog — réception UDP et TCP sur port 5514
-- Redis Streams comme bus d'événements unique avec consumer groups
-- Gestion automatique des null bytes et caractères invalides
+- Suricata IDS — real-time `eve.json` tail with log rotation detection
+- Syslog — UDP and TCP reception on port 5514
+- Redis Streams as single event bus with consumer groups
+- Null byte and invalid character sanitization
 
-### Stockage
-- Table `events` partitionnée par mois (PostgreSQL natif)
-- Table `alerts` avec déduplication par `dedupe_key`
-- Table `alert_events` pour la liaison événements ↔ alertes
-- Table `baselines` pour le versionnage des modèles ML (Phase 4)
-- Table `feedback` pour la vérité terrain opérateur
-- Création automatique des partitions mensuelles via `partition_manager`
+### Storage
+- `events` table partitioned by month (native PostgreSQL)
+- `alerts` table with `dedupe_key` deduplication
+- `alert_events` join table for alert ↔ event linking
+- `ml_scores` table for IsolationForest anomaly scores
+- `baselines` table for versioned ML models
+- `feedback` table for operator ground truth (TP/FP)
+- Automatic monthly partition creation via `partition_manager`
 
-### Détection (3 règles actives)
-- **SSH Bruteforce** — N échecs SSH depuis la même IP sur une fenêtre configurable (syslog)
-- **Suricata haute sévérité** — alertes Suricata au-dessus d'un seuil de sévérité configurable
-- **Port scan** — IP source contactant N ports distincts en moins de X minutes (sévérité adaptative)
+### Detection — Deterministic rules (3 active)
+- **SSH Bruteforce** — N failed SSH attempts from the same IP within a configurable time window (syslog)
+- **Suricata high severity** — Suricata alerts above a configurable severity threshold
+- **Port scan** — source IP contacting N distinct ports within X minutes (adaptive severity)
+
+### Detection — Machine Learning (IsolationForest)
+- Trained on 2+ weeks of real network traffic baseline
+- Continuous anomaly scoring every 30 seconds on new events
+- Adaptive severity based on anomaly score
+- Alert cooldown per IP/event_type to prevent alert storms
+- Operator feedback loop (TP/FP) for model retraining
+- Per-network learning — each deployment learns its own normal traffic profile
 
 ### API
-- FastAPI avec connection pool PostgreSQL
-- WebSocket `/ws/alerts` — push temps réel des alertes
-- Endpoints : `/health`, `/events`, `/alerts`, `/alerts/{id}/events`, `/stats`
-- CORS configurable
+- FastAPI with PostgreSQL connection pool
+- WebSocket `/ws/alerts` — real-time alert push
+- Endpoints: `/health`, `/events`, `/alerts`, `/alerts/{id}/events`, `/stats`
+- Configurable CORS
 
 ### Dashboard
-- Badge Live WebSocket (vert/orange/rouge)
-- KPI temps réel depuis `/stats` (vrais totaux, pas estimations)
-- Top IPs attaquantes
-- Onglet Stats — alertes par règle, par sévérité, timeline 24h
-- Filtres source / statut / recherche
-- Détail alerte avec événements corrélés et métadonnées
+- Live WebSocket badge (green / amber / red)
+- Real-time KPIs from `/stats` (true totals, not estimates)
+- Top attacker IPs
+- Stats tab — alerts by rule, by severity, 24h timeline
+- Source / status / search filters
+- Alert detail panel with correlated events and metadata
 
 ---
 
-## Stack technique
+## Tech Stack
 
-| Composant | Technologie |
+| Component | Technology |
 |---|---|
 | Ingestion | Python 3.11 |
 | Transport | Redis 7 Streams |
-| Stockage | PostgreSQL 16 (partitionné) |
+| Storage | PostgreSQL 16 (partitioned) |
 | IDS | Suricata |
+| ML Detection | scikit-learn IsolationForest |
 | API | FastAPI + uvicorn |
-| Temps réel | WebSocket (uvicorn native) |
+| Real-time | WebSocket (uvicorn native) |
 | Frontend | React 18 + TypeScript + Vite |
 | Reverse proxy | nginx |
 | Orchestration | Docker Compose |
 
 ---
 
-## Structure du projet
+## Project Structure
 
 ```
 sentinelai/
@@ -85,20 +96,22 @@ sentinelai/
 │   ├── postgres/
 │   │   └── migrations/
 │   │       ├── 001_init_schema.sql      # events, alerts, alert_events, baselines, feedback
-│   │       ├── 002_alerting.sql         # dedupe_key, index composites
-│   │       └── 002_create_initial_partitions.sql
+│   │       ├── 002_alerting.sql         # dedupe_key, composite indexes
+│   │       ├── 002_create_initial_partitions.sql
+│   │       └── 003_ml.sql              # ml_scores table
 │   ├── workers/
-│   │   ├── suricata_ingester.py         # lecture eve.json → Redis Streams
+│   │   ├── suricata_ingester.py         # eve.json tail → Redis Streams
 │   │   ├── suricata_worker.py           # Redis → PostgreSQL (Suricata)
 │   │   ├── syslog_ingester.py           # UDP/TCP → Redis Streams
 │   │   ├── syslog_worker.py             # Redis → PostgreSQL (Syslog)
-│   │   ├── alert_worker.py              # moteur de règles + corrélation
-│   │   └── partition_manager.py        # création automatique des partitions
+│   │   ├── alert_worker.py              # deterministic rules engine
+│   │   ├── ml_worker.py                 # IsolationForest training + detection
+│   │   └── partition_manager.py        # automatic monthly partition creation
 │   ├── api/
 │   │   └── main.py                     # FastAPI + WebSocket + connection pool
 │   └── frontend/
 │       └── src/
-│           └── App.tsx                 # Dashboard React temps réel
+│           └── App.tsx                 # Real-time React dashboard
 ```
 
 ---
@@ -109,102 +122,118 @@ sentinelai/
 git clone https://github.com/Veridis-fr/sentinelai
 cd sentinelai
 cp .env.example .env
-# Éditer .env selon votre environnement (interface réseau, credentials, etc.)
+# Edit .env to match your environment (network interface, credentials, etc.)
 docker compose up -d --build
 ```
 
-### Accès
+### Access
 
 | Service | URL |
 |---|---|
 | Dashboard | `http://SERVER_IP` |
 | API | `http://SERVER_IP:8000` |
-| Documentation API | `http://SERVER_IP:8000/docs` |
+| API docs | `http://SERVER_IP:8000/docs` |
 
 ---
 
 ## Configuration
 
-Variables clés dans `.env` :
+Key variables in `.env`:
 
 ```bash
-SURICATA_INTERFACE=eth0          # Interface réseau à surveiller
+SURICATA_INTERFACE=eth0          # Network interface to monitor
 
-# Règles de détection
-SSH_BRUTEFORCE_THRESHOLD=5       # Nombre d'échecs SSH pour déclencher une alerte
-SSH_BRUTEFORCE_WINDOW_MINUTES=5  # Fenêtre de temps
-PORT_SCAN_THRESHOLD=20           # Ports distincts pour déclencher port scan
+# Detection rules
+SSH_BRUTEFORCE_THRESHOLD=5
+SSH_BRUTEFORCE_WINDOW_MINUTES=5
+PORT_SCAN_THRESHOLD=20
 PORT_SCAN_WINDOW_MINUTES=2
 
-# Pool de connexions API
+# ML Worker
+ML_TRAIN_LOOKBACK_HOURS=336      # 14 days baseline
+ML_TRAIN_MIN_EVENTS=10000
+ML_CONTAMINATION=0.01            # Expected anomaly rate
+ML_ANOMALY_THRESHOLD=-0.05       # Score below = anomaly
+ML_ALERT_MIN_SCORE=-0.10         # Only alert on strong anomalies
+ML_FORCE_TRAIN=false             # Set true to force retraining
+
+# API
 PG_POOL_MIN=2
 PG_POOL_MAX=10
-
-# WebSocket
 WS_PUSH_INTERVAL_SECONDS=5
 ```
 
 ---
 
-## Modèle de données
+## Data Model
 
 ```sql
-events        -- événements bruts normalisés, partitionné par event_ts
-alerts        -- alertes corrélées avec déduplication
-alert_events  -- liaison N-N alertes ↔ événements, partitionné
-baselines     -- modèles ML versionnés (Phase 4)
-feedback      -- vérité terrain opérateur (TP/FP)
+events        -- normalized raw events, partitioned by event_ts
+alerts        -- correlated alerts with deduplication
+alert_events  -- N-N join between alerts and events, partitioned
+ml_scores     -- IsolationForest anomaly scores per event
+baselines     -- versioned ML models (pickle + scaler stored as base64)
+feedback      -- operator ground truth (TP/FP) for model retraining
 ```
 
 ---
 
-## Statut du projet
+## ML Onboarding — How it works
 
-| Phase | Description | Statut |
+SentinelAI learns what "normal" looks like for each specific network:
+
+1. **Week 1-2** — collect baseline traffic (deterministic rules active, ML inactive)
+2. **Auto-training** — IsolationForest trains automatically when `ML_TRAIN_MIN_EVENTS` is reached
+3. **Detection** — model scores new events every 30s, alerts on anomalies
+4. **Feedback loop** — operator marks FP/TP, model retrains periodically to improve
+
+Each client deployment learns its own normal profile — a PME with an ERP has different normal traffic than a law firm or a medical practice.
+
+---
+
+## Project Status
+
+| Phase | Description | Status |
 |---|---|---|
-| Phase 0 | Socle infra Docker + PostgreSQL partitionné | ✅ |
-| Phase 1 | Pipeline Suricata → Redis → PostgreSQL | ✅ |
-| Phase 2 | Ingestion Syslog + Filebeat | ✅ |
-| Phase 3 | Règles déterministes + Dashboard V1 | ✅ |
-| Phase 3.5 | WebSocket temps réel + API stats + polish UI | ✅ |
-| Phase 4 | IsolationForest + corrélation incidents | 🔄 Baseline en cours |
-| Phase 5 | LLM co-pilote (Ollama local) | ⏳ |
-| Phase 6 | Hardening + packaging + script install | ⏳ |
+| Phase 0 | Docker infra + partitioned PostgreSQL | ✅ |
+| Phase 1 | Suricata → Redis → PostgreSQL pipeline | ✅ |
+| Phase 2 | Syslog ingestion | ✅ |
+| Phase 3 | Deterministic rules + Dashboard V1 | ✅ |
+| Phase 3.5 | WebSocket live + stats API + UI polish | ✅ |
+| Phase 4 | IsolationForest ML detection | ✅ Active — baseline accumulating |
+| Phase 5 | LLM co-pilot (local Ollama) | ⏳ Next |
+| Phase 6 | Hardening + packaging + install script | ⏳ |
 
 ---
 
-## Roadmap Phase 4
+## Roadmap
 
-- Entraînement IsolationForest sur baseline 2 semaines minimum
-- Table `feedback` pour réentraînement supervisé
-- Corrélation temporelle simple (même IP, même type, fenêtre 5 min = 1 incident)
-- Scoring de risque
+### Phase 5 — LLM co-pilot
+- Local Ollama integration (quantized Mistral 7B)
+- `AI_EXPLAINER_ENABLED` flag — optional, logs never leave the appliance
+- Natural language incident explanation for non-expert SME operators
+- Structured context sent to LLM: alert type, triggered rules, IP, 24h history
+- French language output by default
 
-## Roadmap Phase 5
-
-- Ollama local (Mistral 7B quantisé)
-- Flag `AI_EXPLAINER_ENABLED` — optionnel, les logs ne quittent pas l'appliance
-- Explication incidents en langage naturel pour opérateur PME
-
-## Roadmap Phase 6
-
-- PostgreSQL et Redis sur `127.0.0.1` uniquement
-- Authentification dashboard
-- CORS restrictif
-- Script d'installation one-liner
-- Documentation utilisateur
+### Phase 6 — Hardening & packaging
+- PostgreSQL and Redis bound to `127.0.0.1` only
+- Dashboard authentication
+- Restrictive CORS
+- One-liner install script
+- Automatic ML onboarding mode (2-week baseline → auto-train → detection)
+- User documentation
 
 ---
 
-## Auteur
+## Author
 
 **Valentin Delamare**
 GitHub — [Veridis-fr](https://github.com/Veridis-fr)
 
-SentinelAI est une appliance de cyberdéfense open-source conçue pour rendre la détection de menaces accessible aux PME sans infrastructure SOC dédiée.
+SentinelAI is an open-source cybersecurity appliance designed to bring threat detection to SMEs without a dedicated SOC infrastructure.
 
 ---
 
-## Licence
+## License
 
-MIT	
+MIT
