@@ -20,7 +20,12 @@ SSH_BRUTEFORCE_THRESHOLD     = int(os.getenv("SSH_BRUTEFORCE_THRESHOLD", "5"))
 SURICATA_HIGH_SEVERITY_MIN   = int(os.getenv("SURICATA_HIGH_SEVERITY_MIN", "3"))
 PORT_SCAN_WINDOW_MINUTES     = int(os.getenv("PORT_SCAN_WINDOW_MINUTES", "2"))
 PORT_SCAN_THRESHOLD          = int(os.getenv("PORT_SCAN_THRESHOLD", "20"))
+PORT_SCAN_TCP_ONLY           = os.getenv("PORT_SCAN_TCP_ONLY", "false").lower() == "true"
 STALE_ALERT_HOURS            = int(os.getenv("STALE_ALERT_HOURS", "24"))
+
+# Ports de services connus — utiles pour qualifier la gravité d'un scan
+KNOWN_SERVICE_PORTS = {21, 22, 23, 25, 53, 80, 110, 135, 139, 143, 443, 445,
+                       993, 995, 1433, 1521, 3306, 3389, 5432, 5900, 6379, 8080, 8443}
 
 
 def connect_pg() -> PGConnection:
@@ -268,11 +273,15 @@ def process_suricata_high_severity(cur: PGCursor) -> int:
 
 # ---------------------------------------------------------------------------
 # Règle 3 — Port scan (Suricata)
+# Enrichissement : liste des ports touchés, proto dominant, ports de services connus
 # Sévérité adaptative : <50 ports=2, 50-99=3, 100+=4
+#                       +1 si ports de services connus détectés (22, 443, 3389...)
 # ---------------------------------------------------------------------------
 def process_port_scan(cur: PGCursor) -> int:
+    proto_filter = "AND proto = 'TCP'" if PORT_SCAN_TCP_ONLY else ""
+
     cur.execute(
-        """
+        f"""
         WITH candidates AS (
             SELECT
                 src_ip::text                        AS scanner_ip,
@@ -280,16 +289,20 @@ def process_port_scan(cur: PGCursor) -> int:
                 COUNT(DISTINCT dest_port)            AS distinct_ports,
                 MIN(event_ts)                        AS first_seen,
                 MAX(event_ts)                        AS last_seen,
-                COUNT(*)                             AS hit_count
+                COUNT(*)                             AS hit_count,
+                array_agg(DISTINCT dest_port ORDER BY dest_port) AS port_list,
+                mode() WITHIN GROUP (ORDER BY proto) AS dominant_proto
             FROM events
             WHERE source = 'suricata'
               AND event_ts >= NOW() - (%s || ' minutes')::interval
               AND src_ip IS NOT NULL
               AND dest_port IS NOT NULL
+              {proto_filter}
             GROUP BY src_ip::text, COALESCE(dest_ip::text, 'unknown')
             HAVING COUNT(DISTINCT dest_port) >= %s
         )
-        SELECT scanner_ip, target_ip, distinct_ports, first_seen, last_seen, hit_count
+        SELECT scanner_ip, target_ip, distinct_ports, first_seen, last_seen,
+               hit_count, port_list, dominant_proto
         FROM candidates
         ORDER BY distinct_ports DESC
         """,
@@ -299,9 +312,15 @@ def process_port_scan(cur: PGCursor) -> int:
     candidates = cur.fetchall()
     created_or_updated = 0
 
-    for scanner_ip, target_ip, distinct_ports, first_seen, last_seen, hit_count in candidates:
+    for scanner_ip, target_ip, distinct_ports, first_seen, last_seen, hit_count, port_list, dominant_proto in candidates:
         dedupe_key = build_dedupe_key("port_scan", f"{scanner_ip}:{target_ip}")
 
+        # Ports de services connus touchés
+        port_list_clean = [p for p in (port_list or []) if p is not None]
+        service_ports_hit = sorted([p for p in port_list_clean if p in KNOWN_SERVICE_PORTS])
+        has_service_ports = len(service_ports_hit) > 0
+
+        # Sévérité adaptative
         if distinct_ports >= 100:
             severity = 4
         elif distinct_ports >= 50:
@@ -309,25 +328,42 @@ def process_port_scan(cur: PGCursor) -> int:
         else:
             severity = 2
 
+        # Bonus sévérité si ports de services connus ciblés
+        if has_service_ports and severity < 4:
+            severity += 1
+
+        # Titre enrichi
+        proto_label = dominant_proto or "unknown"
+        title = f"Scan de ports {proto_label.upper()} depuis {scanner_ip} vers {target_ip}"
+        if service_ports_hit:
+            services = ", ".join(str(p) for p in service_ports_hit[:5])
+            title += f" — ports sensibles : {services}"
+
         alert_id = upsert_alert(
             cur,
             dedupe_key=dedupe_key,
             rule_key="port_scan",
-            title=f"Scan de ports depuis {scanner_ip} vers {target_ip}",
+            title=title,
             severity=severity,
             source="suricata",
             first_seen=first_seen,
             last_seen=last_seen,
             metadata={
-                "rule_key":       "port_scan",
-                "scanner_ip":     scanner_ip,
-                "target_ip":      target_ip,
-                "distinct_ports": int(distinct_ports),
-                "hit_count":      int(hit_count),
-                "window_minutes": PORT_SCAN_WINDOW_MINUTES,
-                "threshold":      PORT_SCAN_THRESHOLD,
+                "rule_key":           "port_scan",
+                "scanner_ip":         scanner_ip,
+                "target_ip":          target_ip,
+                "distinct_ports":     int(distinct_ports),
+                "hit_count":          int(hit_count),
+                "window_minutes":     PORT_SCAN_WINDOW_MINUTES,
+                "threshold":          PORT_SCAN_THRESHOLD,
+                "dominant_proto":     proto_label,
+                "port_list":          port_list_clean[:50],   # max 50 ports dans metadata
+                "service_ports_hit":  service_ports_hit,
+                "has_service_ports":  has_service_ports,
+                "tcp_only_mode":      PORT_SCAN_TCP_ONLY,
             },
         )
+
         cur.execute(
             """
             SELECT event_id, event_ts FROM events
@@ -347,7 +383,8 @@ def process_port_scan(cur: PGCursor) -> int:
         created_or_updated += 1
         print(
             f"[alert-worker] rule=port_scan alert_id={alert_id} "
-            f"scanner={scanner_ip} target={target_ip} ports={distinct_ports}",
+            f"scanner={scanner_ip} target={target_ip} ports={distinct_ports} "
+            f"proto={proto_label} service_ports={service_ports_hit}",
             flush=True,
         )
 
